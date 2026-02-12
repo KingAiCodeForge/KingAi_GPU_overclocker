@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+kingai_gpu.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+.env
+*.log
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Research notes, probe scripts, byte dumps — stay local
+ignore/
+tests/probe_*
