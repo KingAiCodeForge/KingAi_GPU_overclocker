@@ -29,7 +29,45 @@ Design: Imports are deferred inside each branch so that:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from datetime import datetime
+
+
+# ── Logging tee ─────────────────────────────────────────────────────────────
+class _Tee:
+    """Write to both a file and the original stream."""
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log.write(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _init_log(command: str) -> str:
+    """Set up file logging. Returns the log file path.
+
+    Writes to <repo_root>/logs/<command>_<timestamp>.log.
+    All print() output goes to both console and log file.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    logs_dir = os.path.join(repo_root, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(logs_dir, f"{command}_{stamp}.log")
+    log_file = open(log_path, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_file)
+    sys.stderr = _Tee(sys.__stderr__, log_file)
+    return log_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -124,6 +162,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+
+    # Init logging tee — all subcommand output goes to logs/<command>_<ts>.log
+    cmd_name = args.command if args.command not in ("mon", "m") else "monitor"
+    cmd_name = cmd_name if cmd_name != "mem" else "memtest"
+    log_path = _init_log(cmd_name)
+    ts = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    print(f"{ts} kingai-gpu {cmd_name} — log: {log_path}")
 
     # Deferred imports: each subcommand only imports what it needs.
     # This keeps 'monitor' working on Linux where nvapi.py would fail to import.
