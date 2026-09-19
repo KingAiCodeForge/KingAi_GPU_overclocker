@@ -14,7 +14,7 @@ Usage examples:
     kingai-gpu monitor [--once] [--json] [--interval N] [--gpu N]
     kingai-gpu oc [--core N] [--mem N] [--power N] [--fan N] [--reset]
     kingai-gpu oc --save profile.json          # snapshot current settings
-    kingai-gpu oc --load profile.json          # apply saved profile
+    kingai-gpu oc --load profile.json          # plan saved profile
     kingai-gpu memtest [--sweep] [--duration N]
     kingai-gpu import-msi path/to/VEN_10DE...cfg --list
     kingai-gpu import-msi path/to/VEN_10DE...cfg --section Profile3
@@ -32,6 +32,7 @@ import argparse
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 
 # ── Logging tee ─────────────────────────────────────────────────────────────
@@ -56,18 +57,27 @@ class _Tee:
 def _init_log(command: str) -> str:
     """Set up file logging. Returns the log file path.
 
-    Writes to <repo_root>/logs/<command>_<timestamp>.log.
-    All print() output goes to both console and log file.
+    Writes to a per-user state directory (or ``KINGAI_GPU_LOG_DIR``).
+    stdout and stderr are mirrored to the file without modifying the console
+    bytes. The launcher banner itself is emitted only on stderr, so JSON,
+    JSONL, CSV, and other machine-readable stdout modes remain parseable.
     """
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    logs_dir = os.path.join(repo_root, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(logs_dir, f"{command}_{stamp}.log")
-    log_file = open(log_path, "w", encoding="utf-8")
+    configured = os.environ.get("KINGAI_GPU_LOG_DIR")
+    if configured:
+        logs_dir = Path(configured).expanduser()
+    elif os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
+        logs_dir = base / "KingAiGPU" / "logs"
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+        logs_dir = base / "kingai-gpu"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    log_path = logs_dir / f"{command}_{stamp}.log"
+    log_file = open(log_path, "x", encoding="utf-8")
     sys.stdout = _Tee(sys.__stdout__, log_file)
     sys.stderr = _Tee(sys.__stderr__, log_file)
-    return log_path
+    return str(log_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,17 +100,23 @@ def build_parser() -> argparse.ArgumentParser:
     #   --compact = single-line for narrow terminals
     mon = sub.add_parser("monitor", aliases=["mon", "m"], help="Real-time GPU monitoring")
     mon.add_argument("--once", action="store_true", help="Print one snapshot and exit")
-    mon.add_argument("--json", action="store_true", help="Output as JSON")
-    mon.add_argument("--csv", action="store_true", help="Output as CSV (for logging)")
+    mon_format = mon.add_mutually_exclusive_group()
+    mon_format.add_argument("--json", action="store_true", help="Output JSON (JSONL continuously)")
+    mon_format.add_argument("--csv", action="store_true", help="Output as CSV (for logging)")
     mon.add_argument("--interval", "-i", type=float, default=1.0, help="Poll interval (seconds)")
     mon.add_argument("--gpu", "-g", type=int, default=0, help="GPU index")
     mon.add_argument("--compact", "-c", action="store_true", help="Single-line compact output")
 
-    # ── oc ── Overclock / undervolt control (Windows-only via NVAPI)
+    # ── oc ── Clock-offset and limit control (Windows-only via NVAPI)
     # All values are offsets from stock (e.g., --core +150 = +150 MHz above base).
     # If no Set flags are given, shows current OC status (read-only).
-    oc = sub.add_parser("oc", help="Overclock / undervolt control")
-    oc.add_argument("--core", type=int, default=None, help="Core clock offset (MHz)")
+    oc = sub.add_parser("oc", help="Clock-offset and limit control")
+    oc.add_argument(
+        "--core",
+        type=int,
+        default=None,
+        help="Core clock offset (MHz); a negative offset is not voltage control",
+    )
     oc.add_argument("--mem", type=int, default=None, help="Memory clock offset (MHz)")
     oc.add_argument("--power", type=int, default=None, help="Power limit (%%)")
     oc.add_argument("--thermal", type=int, default=None, help="Thermal limit (°C)")
@@ -110,9 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
     oc.add_argument("--save", type=str, default=None, metavar="PATH",
                     help="Save current OC settings to JSON profile")
     oc.add_argument("--load", type=str, default=None, metavar="PATH",
-                    help="Load and apply OC settings from JSON profile")
+                    help="Load and plan settings from a JSON profile")
     oc.add_argument("--gpu", "-g", type=int, default=0, help="GPU index")
     oc.add_argument("--status", "-s", action="store_true", help="Show current OC status")
+    oc.add_argument(
+        "--execute",
+        action="store_true",
+        help="Apply the planned hardware change (default is dry-run)",
+    )
 
     # ── memtest ── VRAM stability testing
     # Default = single pass pattern test (write/read/verify VRAM patterns).
@@ -125,6 +146,11 @@ def build_parser() -> argparse.ArgumentParser:
     mt.add_argument("--step", type=int, default=50, help="Sweep step size (MHz)")
     mt.add_argument("--gpu", "-g", type=int, default=0, help="GPU index")
     mt.add_argument("--size", type=int, default=256, help="Test buffer size (MB)")
+    mt.add_argument(
+        "--execute",
+        action="store_true",
+        help="Apply memory offsets during --sweep (default is dry-run)",
+    )
 
     # ── info ── Static GPU information (no continuous monitoring)
     sub.add_parser("info", help="Detailed GPU information")
@@ -145,6 +171,11 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--save", type=str, default=None, metavar="PATH",
                      help="Convert to KingAi JSON profile (don't apply)")
     imp.add_argument("--gpu", "-g", type=int, default=0, help="GPU index")
+    imp.add_argument(
+        "--execute",
+        action="store_true",
+        help="Apply the imported settings (default is dry-run)",
+    )
 
     return p
 
@@ -166,9 +197,13 @@ def main(argv: list[str] | None = None) -> int:
     # Init logging tee — all subcommand output goes to logs/<command>_<ts>.log
     cmd_name = args.command if args.command not in ("mon", "m") else "monitor"
     cmd_name = cmd_name if cmd_name != "mem" else "memtest"
-    log_path = _init_log(cmd_name)
+    try:
+        log_path = _init_log(cmd_name)
+    except OSError as exc:
+        log_path = "disabled"
+        print(f"Warning: unable to create diagnostic log: {exc}", file=sys.stderr)
     ts = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-    print(f"{ts} kingai-gpu {cmd_name} — log: {log_path}")
+    print(f"{ts} kingai-gpu {cmd_name} — log: {log_path}", file=sys.stderr)
 
     # Deferred imports: each subcommand only imports what it needs.
     # This keeps 'monitor' working on Linux where nvapi.py would fail to import.

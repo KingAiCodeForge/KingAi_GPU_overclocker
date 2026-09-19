@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kingai-gpu"
-version = "0.1.0"
+version = "0.2.0"
 description = "Open-source GPU monitoring, overclocking, and stability testing for NVIDIA GPUs"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "nvidia-ml-py>=12.0.0",
@@ -27,3 +28,9 @@ include = ["kingai_gpu*"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+exclude = ["ignore", "tests/probe_*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --basetemp=.pytest-tmp"

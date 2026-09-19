@@ -20,10 +20,12 @@ import json
 import os
 import sys
 import time
+import csv
+import io
 from dataclasses import asdict
 from datetime import datetime
 
-from kingai_gpu.lib.nvml import GpuSnapshot, gpu_count, snapshot, snapshot_all
+from kingai_gpu.lib.nvml import GpuSnapshot, gpu_count, snapshot
 
 
 # ── Formatting helpers ──
@@ -159,7 +161,7 @@ def render_dashboard(s: GpuSnapshot) -> str:
 
 def output_json(s: GpuSnapshot) -> str:
     d = asdict(s)
-    return json.dumps(d, indent=2)
+    return json.dumps(d, separators=(",", ":"), ensure_ascii=False)
 
 
 def output_csv_header() -> str:
@@ -172,15 +174,64 @@ def output_csv_header() -> str:
 def output_csv_row(s: GpuSnapshot) -> str:
     ts = datetime.fromtimestamp(s.timestamp).strftime("%Y-%m-%d %H:%M:%S")
     throttle = "|".join(s.throttle_reasons)
-    return (
-        f"{ts},{s.name},{s.temp_gpu},{s.clock_gpu},{s.clock_mem},{s.power_draw:.1f},"
-        f"{s.power_limit:.1f},{s.fan_speed},{s.util_gpu},{s.util_mem},{s.vram_used},"
-        f"{s.vram_total},{s.pstate},{throttle}"
+    target = io.StringIO(newline="")
+    writer = csv.writer(target, lineterminator="")
+    writer.writerow(
+        [
+            ts,
+            s.name,
+            s.temp_gpu,
+            s.clock_gpu,
+            s.clock_mem,
+            f"{s.power_draw:.1f}",
+            f"{s.power_limit:.1f}",
+            s.fan_speed,
+            s.util_gpu,
+            s.util_mem,
+            s.vram_used,
+            s.vram_total,
+            s.pstate,
+            throttle,
+        ]
     )
+    return target.getvalue()
 
 
 # ── Commands ──
 # These are the handler functions called from cli/main.py via deferred import.
+
+
+def _error_detail(exc: Exception) -> str:
+    """Return a concise exception description suitable for stable CLI stderr."""
+
+    return str(exc).strip() or type(exc).__name__
+
+
+def _validated_gpu_count() -> tuple[int | None, int]:
+    """Return ``(count, exit_code)`` while containing NVML startup failures."""
+
+    try:
+        count = gpu_count()
+    except Exception as exc:
+        print(
+            f"Unable to initialize NVIDIA monitoring: {_error_detail(exc)}",
+            file=sys.stderr,
+        )
+        return None, 1
+    if count <= 0:
+        print("No NVIDIA GPUs were reported by NVML.", file=sys.stderr)
+        return None, 1
+    return count, 0
+
+
+def _read_snapshot(index: int) -> GpuSnapshot | None:
+    """Read one snapshot and contain invalid-handle/device-loss failures."""
+
+    try:
+        return snapshot(index)
+    except Exception as exc:
+        print(f"Unable to read GPU {index}: {_error_detail(exc)}", file=sys.stderr)
+        return None
 
 def cmd_monitor(args) -> int:
     """Main monitor command handler.
@@ -189,10 +240,29 @@ def cmd_monitor(args) -> int:
     In continuous mode, refreshes the screen at --interval rate until Ctrl+C.
     """
 
+    if args.interval <= 0:
+        print("Monitor interval must be greater than zero.", file=sys.stderr)
+        return 2
+    if args.gpu < 0:
+        print("GPU index must not be negative.", file=sys.stderr)
+        return 2
+
+    count, error_code = _validated_gpu_count()
+    if count is None:
+        return error_code
+    if args.gpu >= count:
+        print(
+            f"GPU index {args.gpu} is out of range; available indices are 0 through {count - 1}.",
+            file=sys.stderr,
+        )
+        return 2
+
     # Single snapshot — read once, output, exit. Good for scripting:
     #   kingai-gpu monitor --once --json | jq .temp_gpu
     if args.once:
-        s = snapshot(args.gpu)
+        s = _read_snapshot(args.gpu)
+        if s is None:
+            return 1
         if args.json:
             print(output_json(s))
         elif args.csv:
@@ -213,11 +283,12 @@ def cmd_monitor(args) -> int:
     try:
         first = True
         while True:
-            s = snapshot(args.gpu)
+            s = _read_snapshot(args.gpu)
+            if s is None:
+                return 1
 
             if args.json:
                 print(output_json(s))
-                print("---")
             elif args.csv:
                 if first:
                     print(output_csv_header())
@@ -234,17 +305,22 @@ def cmd_monitor(args) -> int:
 
             time.sleep(args.interval)
     except KeyboardInterrupt:
-        print("\nMonitoring stopped.")
+        stream = sys.stderr if args.json or args.csv else sys.stdout
+        print("\nMonitoring stopped.", file=stream)
         return 0
 
 
 def cmd_info(_args) -> int:
     """Print detailed GPU info for all GPUs."""
-    count = gpu_count()
+    count, error_code = _validated_gpu_count()
+    if count is None:
+        return error_code
     print(f"Found {count} NVIDIA GPU(s)\n")
 
     for i in range(count):
-        s = snapshot(i)
+        s = _read_snapshot(i)
+        if s is None:
+            return 1
         print(f"═══ GPU {i}: {s.name} ═══")
         print(f"  Driver:        {s.driver_version}")
         print(f"  PCI Bus:       {s.pci_bus_id}")

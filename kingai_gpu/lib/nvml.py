@@ -6,8 +6,8 @@ the NVIDIA Management Library (NVML). NVML is a C library that ships
 with every NVIDIA driver and exposes read-only GPU sensor data.
 
 Key design decisions:
-  - Single GpuSnapshot dataclass captures ALL readable sensor values
-    in one atomic read — no stale partial state.
+  - Single GpuSnapshot dataclass collects all readable sensor values through a
+    short sequence of NVML calls. It is best-effort, not an atomic sample.
   - Every sensor read is wrapped in _safe() which catches NVMLError
     and returns a default value. This prevents one unsupported sensor
     from crashing the entire snapshot.
@@ -116,6 +116,8 @@ class GpuSnapshot:
     driver_version: str = ""
     pci_bus_id: str = ""
     uuid: str = ""
+    pci_device_id: str = ""
+    pci_subsystem_id: str = ""
 
     # Clocks (MHz) — current and maximum boost frequencies
     clock_gpu: int = 0          # Current core/graphics clock
@@ -203,6 +205,14 @@ def _safe(fn, *args, default=None):
         return default
 
 
+def _text(value) -> str:
+    """Normalize pynvml's version-dependent bytes/string return values."""
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 # ── Main API ─────────────────────────────────────────────────────────────────
 
 def gpu_count() -> int:
@@ -220,9 +230,10 @@ def get_handle(index: int = 0):
 def snapshot(index: int = 0) -> GpuSnapshot:
     """Take a full sensor snapshot of a GPU.
 
-    This is the workhorse function. It reads ~20 different sensor values
-    in one call, producing an atomic snapshot. Each sensor is read via
-    _safe() so failures in one don't affect others.
+    This is the workhorse function. It reads ~20 different sensor values in a
+    short sequence, producing a best-effort point-in-time snapshot rather than
+    an atomic hardware sample. Each sensor is read via _safe() so failures in
+    one don't affect others.
 
     Performance: ~1-2ms per call on modern GPUs (NVML is very fast).
     Safe to call at 1 Hz for dashboard, or 10 Hz for detailed logging.
@@ -233,12 +244,17 @@ def snapshot(index: int = 0) -> GpuSnapshot:
 
     # Identity — these are static but we read them every time for simplicity.
     # Could be cached per-GPU for slight perf gain (not worth the complexity).
-    s.name = _safe(nvml.nvmlDeviceGetName, h, default="Unknown")
-    s.driver_version = _safe(nvml.nvmlSystemGetDriverVersion, default="?")
+    s.name = _text(_safe(nvml.nvmlDeviceGetName, h, default="Unknown"))
+    s.driver_version = _text(_safe(nvml.nvmlSystemGetDriverVersion, default="?"))
     # PCI bus ID may come back as bytes or str depending on pynvml version
-    raw_bus = _safe(lambda hh: nvml.nvmlDeviceGetPciInfo(hh).busId, h, default="")
+    pci_info = _safe(nvml.nvmlDeviceGetPciInfo, h, default=None)
+    raw_bus = getattr(pci_info, "busId", "") if pci_info is not None else ""
     s.pci_bus_id = raw_bus.decode("utf-8", errors="replace") if isinstance(raw_bus, bytes) else str(raw_bus)
-    s.uuid = _safe(nvml.nvmlDeviceGetUUID, h, default="")
+    raw_device = getattr(pci_info, "pciDeviceId", 0) if pci_info is not None else 0
+    raw_subsystem = getattr(pci_info, "pciSubSystemId", 0) if pci_info is not None else 0
+    s.pci_device_id = f"{int(raw_device):08X}" if raw_device else ""
+    s.pci_subsystem_id = f"{int(raw_subsystem):08X}" if raw_subsystem else ""
+    s.uuid = _text(_safe(nvml.nvmlDeviceGetUUID, h, default=""))
 
     # Clocks — current frequencies and max boost clocks
     s.clock_gpu = _safe(nvml.nvmlDeviceGetClockInfo, h, nvml.NVML_CLOCK_GRAPHICS, default=0)

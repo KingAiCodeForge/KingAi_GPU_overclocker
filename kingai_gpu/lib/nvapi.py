@@ -19,6 +19,8 @@ import sys
 import time
 from dataclasses import dataclass
 
+from kingai_gpu.lib.backend import require_execute
+
 # NVAPI is Windows-only — it's a Windows DLL that talks to the NVIDIA kernel
 # driver (nvlddmkm.sys). On Linux, use nvidia-smi or NVML directly.
 if sys.platform != "win32":
@@ -449,7 +451,7 @@ def _handle(gpu: int = 0) -> ctypes.c_void_p:
     entry point that triggers lazy initialization.
     """
     _init()
-    if gpu >= _gpu_count.value:
+    if gpu < 0 or gpu >= _gpu_count.value:
         raise NvApiError("GPU_GetHandle", -5)  # -5 = INVALID_ARGUMENT
     return _gpu_handles[gpu]
 
@@ -536,8 +538,10 @@ def _read_clock_delta(buf, domain_id: int) -> tuple[int, int, int]:
             val = _i32(buf, base + _CK_DELTA_VAL)
             lo = _i32(buf, base + _CK_DELTA_MIN)
             hi = _i32(buf, base + _CK_DELTA_MAX)
+            if lo >= hi or not lo <= val <= hi:
+                raise NvApiError(f"GPU_GetPstates20(domain={domain_id},layout)", -9)
             return (val, lo, hi)
-    return (0, 0, 0)
+    raise NvApiError(f"GPU_GetPstates20(domain={domain_id})", -3)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -621,7 +625,10 @@ def _get_power_status(gpu: int = 0) -> int:
     if fn is None:
         raise NvApiError("GPU_ClientPowerPoliciesGetStatus", -3)
     _check("GPU_ClientPowerPoliciesGetStatus", fn(h, ctypes.cast(b, ctypes.c_void_p)))
-    return _u32(b, _PWR_STATUS_POWER)
+    value = _u32(b, _PWR_STATUS_POWER)
+    if not 30000 <= value <= 200000:
+        raise NvApiError("GPU_ClientPowerPoliciesGetStatus(layout)", -9)
+    return value
 
 
 def _get_power_info(gpu: int = 0) -> tuple[int, int, int]:
@@ -629,7 +636,8 @@ def _get_power_info(gpu: int = 0) -> tuple[int, int, int]:
     Read power limits from GetInfo struct.
 
     Returns (min_pcm, default_pcm, max_pcm) in PCM units.
-    Falls back to scanning buffer for recognizable PCM values if primary offsets fail.
+    Only the primary known layout is accepted for write/rollback decisions.
+    Heuristic scans and hardcoded defaults are deliberately refused.
     """
     h = _handle(gpu)
     b = _buf(_POWER_INFO_SIZE, 1)
@@ -643,32 +651,9 @@ def _get_power_info(gpu: int = 0) -> tuple[int, int, int]:
     def_p = _u32(b, _PWR_INFO_DEF)
     max_p = _u32(b, _PWR_INFO_MAX)
 
-    # Validate: default power should be in sane range (30%-200%).
-    # Some driver versions or GPU models put the values at different offsets.
-    if 30000 <= def_p <= 200000:
+    if 30000 <= min_p <= def_p <= max_p <= 200000:
         return (min_p, def_p, max_p)
-
-    # GRACEFUL DEGRADATION: If primary offsets miss, scan the entire buffer
-    # for uint32 values that look like PCM power values. This handles
-    # struct layout shifts across different driver versions.
-    pcm_candidates = []
-    for off in range(4, len(b) - 3, 4):
-        val = _u32(b, off)
-        if 30000 <= val <= 200000:
-            pcm_candidates.append((off, val))
-
-    # Look for 100000 (100.0% = factory default). Min is typically before it,
-    # max after it in the buffer. This heuristic works across all known layouts.
-    for i, (off, val) in enumerate(pcm_candidates):
-        if val == 100000:  # default power = 100.000%
-            # min is likely before, max after
-            min_p = pcm_candidates[i - 1][1] if i > 0 else 50000
-            max_p = pcm_candidates[i + 1][1] if i < len(pcm_candidates) - 1 else 116000
-            return (min_p, 100000, max_p)
-
-    # Last resort: hardcoded safe defaults (50% min, 100% default, 116% max).
-    # These are conservative and work for most GeForce cards.
-    return (50000, 100000, 116000)
+    raise NvApiError("GPU_ClientPowerPoliciesGetInfo(layout)", -9)
 
 
 def _set_power_status(power_pcm: int, gpu: int = 0):
@@ -734,7 +719,10 @@ def _get_thermal_limit(gpu: int = 0) -> int:
     _check("GPU_ClientThermalPoliciesGetLimit", fn(h, ctypes.cast(b, ctypes.c_void_p)))
     raw = _u32(b, _THERMAL_LIMIT_VALUE)
     # Undo the <<8 shift: e.g., raw=21248 → 21248>>8 = 83°C
-    return raw >> 8
+    value = raw >> 8
+    if not 30 <= value <= 120:
+        raise NvApiError("GPU_ClientThermalPoliciesGetLimit(layout)", -9)
+    return value
 
 
 def _get_thermal_info(gpu: int = 0) -> tuple[int, int, int]:
@@ -763,27 +751,9 @@ def _get_thermal_info(gpu: int = 0) -> tuple[int, int, int]:
         def_t >>= 8
         max_t >>= 8
 
-    # Sanity check: default thermal limit should be 30-120°C for any GPU
-    if not (30 <= def_t <= 120):
-        # Fallback: scan buffer for temp-like values
-        found_temps = []
-        for off in range(8, len(b) - 3, 4):
-            raw = _u32(b, off)
-            candidate = raw
-            if 30 <= (raw >> 8) <= 120:
-                candidate = raw >> 8
-            if 60 <= candidate <= 100:
-                found_temps.append(candidate)
-        if found_temps:
-            min_t = min(found_temps)
-            max_t = max(found_temps)
-            def_t = (min_t + max_t) // 2
-        else:
-            # Hardcoded safe defaults — 65°C min, 83°C default, 90°C max.
-            # These are typical for mid-range GeForce cards (RTX 3060-3080).
-            min_t, def_t, max_t = 65, 83, 90
-
-    return (min_t, def_t, max_t)
+    if 30 <= min_t <= def_t <= max_t <= 120:
+        return (min_t, def_t, max_t)
+    raise NvApiError("GPU_ClientThermalPoliciesGetInfo(layout)", -9)
 
 
 def _set_thermal_limit(temp_c: int, gpu: int = 0, priority: bool = False):
@@ -927,7 +897,6 @@ def _set_fan_new_api(speed_pct: int, manual: bool = True, gpu: int = 0):
     #
     # We compute entry size dynamically: (total_size - header) / count
     # If the math doesn't make sense, bail to old API.
-    ENTRY_SIZE_GUESS = 68  # Expected: (1452 - 12) / 21 entries ≈ 68
     if count <= 0 or count > 32:
         _set_cooler_level(speed_pct, 0, gpu)
         return
@@ -949,6 +918,38 @@ def _set_fan_new_api(speed_pct: int, manual: bool = True, gpu: int = 0):
             _w32(b, mode_off, mode_val)
 
     _check_set("GPU_ClientFanCoolersSetControl", fn_set, h, ctypes.cast(b, ctypes.c_void_p))
+
+
+def _get_fan_control(gpu: int = 0) -> int | None:
+    """Return manual fan percentage, or ``None`` when confirmed automatic.
+
+    Raises when the driver does not expose a layout we can identify. Callers
+    use that distinction to avoid pretending an unknown prior fan mode is
+    safely rollbackable.
+    """
+
+    h = _handle(gpu)
+    fn_get = _fn.get("GPU_ClientFanCoolersGetControl")
+    if fn_get is None:
+        raise NvApiError("GPU_ClientFanCoolersGetControl", -3)
+    buffer = _buf(_FAN_CONTROL_SIZE, 1)
+    _check(
+        "GPU_ClientFanCoolersGetControl",
+        fn_get(h, ctypes.cast(buffer, ctypes.c_void_p)),
+    )
+    count = _u32(buffer, 8) or _u32(buffer, 4)
+    if count <= 0 or count > 32:
+        raise NvApiError("GPU_ClientFanCoolersGetControl", -9)
+    entry_size = (_FAN_CONTROL_SIZE - 12) // count
+    if entry_size < 16 or entry_size > 256:
+        raise NvApiError("GPU_ClientFanCoolersGetControl", -9)
+    level = _u32(buffer, 12 + 8)
+    mode = _u32(buffer, 12 + 12)
+    if mode == 0:
+        return None
+    if mode == 1 and level <= 100:
+        return int(level)
+    raise NvApiError("GPU_ClientFanCoolersGetControl", -9)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -976,7 +977,14 @@ class OcStatus:
     power_range_pct: tuple[float, float] = (50.0, 150.0)
     thermal_c: int = 83
     thermal_range_c: tuple[int, int] = (65, 90)
-    fan_pct: int | None = None  # None = auto/unknown, 0-100 = manual speed
+    fan_pct: int | None = None  # None = auto when fan_control_known, else unknown
+    fan_control_known: bool = False
+    power_default_pct: float = 100.0
+    thermal_default_c: int = 83
+    core_read_valid: bool = False
+    mem_read_valid: bool = False
+    power_read_valid: bool = False
+    thermal_read_valid: bool = False
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1086,13 +1094,14 @@ def _note_fan_api(api: str, gpu: int = 0):
 # Public API  (matches overclock.py imports)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def enable_oc(gpu: int = 0):
+def enable_oc(gpu: int = 0, *, execute: bool = False):
     """Initialize NVAPI and validate GPU index.
 
     Must be called before any Set operations. Ensures the DLL is loaded,
     all function pointers are resolved, and the requested GPU exists.
     Subsequent calls are no-ops (idempotent).
     """
+    require_execute(execute)
     _init()
     _ = _handle(gpu)  # Validate GPU index exists, raises on invalid
 
@@ -1111,14 +1120,23 @@ def get_oc_status(gpu: int = 0) -> OcStatus:
     # Clock offsets from PStates20 — the most reliable read
     try:
         ps_buf = _get_pstates20(gpu)
-        core_val, core_min, core_max = _read_clock_delta(ps_buf, domain_id=0)
-        mem_val, mem_min, mem_max = _read_clock_delta(ps_buf, domain_id=4)
-        s.core_offset_mhz = core_val / 1000.0
-        s.core_offset_range_mhz = (core_min / 1000.0, core_max / 1000.0)
-        s.mem_offset_mhz = mem_val / 1000.0
-        s.mem_offset_range_mhz = (mem_min / 1000.0, mem_max / 1000.0)
     except NvApiError:
-        pass
+        ps_buf = None
+    if ps_buf is not None:
+        try:
+            core_val, core_min, core_max = _read_clock_delta(ps_buf, domain_id=0)
+            s.core_offset_mhz = core_val / 1000.0
+            s.core_offset_range_mhz = (core_min / 1000.0, core_max / 1000.0)
+            s.core_read_valid = True
+        except NvApiError:
+            pass
+        try:
+            mem_val, mem_min, mem_max = _read_clock_delta(ps_buf, domain_id=4)
+            s.mem_offset_mhz = mem_val / 1000.0
+            s.mem_offset_range_mhz = (mem_min / 1000.0, mem_max / 1000.0)
+            s.mem_read_valid = True
+        except NvApiError:
+            pass
 
     # Power limit — reads current target and allowed range
     try:
@@ -1126,13 +1144,18 @@ def get_oc_status(gpu: int = 0) -> OcStatus:
         min_pcm, def_pcm, max_pcm = _get_power_info(gpu)
         if def_pcm > 0:
             s.power_pct = current_pcm / 1000.0
+            s.power_default_pct = def_pcm / 1000.0
             s.power_range_pct = (min_pcm / 1000.0, max_pcm / 1000.0)
+            s.power_read_valid = True
     except NvApiError:
         pass
 
     # Thermal limit — current throttle point
+    thermal_current_valid = False
+    thermal_range_valid = False
     try:
         s.thermal_c = _get_thermal_limit(gpu)
+        thermal_current_valid = True
     except NvApiError:
         pass  # Keep default (83°C)
 
@@ -1140,6 +1163,17 @@ def get_oc_status(gpu: int = 0) -> OcStatus:
     try:
         t_min, t_def, t_max = _get_thermal_info(gpu)
         s.thermal_range_c = (t_min, t_max)
+        s.thermal_default_c = t_def
+        thermal_range_valid = True
+    except NvApiError:
+        pass
+    s.thermal_read_valid = thermal_current_valid and thermal_range_valid
+
+    # Fan control mode must be known before the safe CLI will change it,
+    # because otherwise an exact rollback cannot be attempted.
+    try:
+        s.fan_pct = _get_fan_control(gpu)
+        s.fan_control_known = True
     except NvApiError:
         pass
 
@@ -1150,28 +1184,46 @@ def get_oc_status(gpu: int = 0) -> OcStatus:
     return s
 
 
-def set_core_offset(mhz: int, gpu: int = 0):
-    """Set core (graphics) clock offset in MHz. Positive = overclock, negative = undervolt."""
-    _set_clock_offset(domain_id=0, offset_khz=mhz * 1000, gpu=gpu)
+def set_core_offset(
+    mhz: int | float,
+    gpu: int = 0,
+    *,
+    execute: bool = False,
+):
+    """Set a core clock offset in MHz.
+
+    A negative clock offset lowers the requested frequency offset; it does not
+    program voltage and must not be described as V/F-curve undervolting.
+    """
+    require_execute(execute)
+    _set_clock_offset(domain_id=0, offset_khz=int(round(mhz * 1000)), gpu=gpu)
 
 
-def set_mem_offset(mhz: int, gpu: int = 0):
+def set_mem_offset(
+    mhz: int | float,
+    gpu: int = 0,
+    *,
+    execute: bool = False,
+):
     """Set memory clock offset in MHz. Positive = overclock."""
-    _set_clock_offset(domain_id=4, offset_khz=mhz * 1000, gpu=gpu)
+    require_execute(execute)
+    _set_clock_offset(domain_id=4, offset_khz=int(round(mhz * 1000)), gpu=gpu)
 
 
-def set_power_limit(pct: float, gpu: int = 0):
+def set_power_limit(pct: float, gpu: int = 0, *, execute: bool = False):
     """Set power limit as percentage (e.g., 100 = default, 125 = +25%)."""
+    require_execute(execute)
     pcm = int(pct * 1000)
     _set_power_status(pcm, gpu)
 
 
-def set_thermal_limit(temp_c: int, gpu: int = 0):
+def set_thermal_limit(temp_c: int, gpu: int = 0, *, execute: bool = False):
     """Set thermal limit in degrees Celsius."""
+    require_execute(execute)
     _set_thermal_limit(temp_c, gpu)
 
 
-def set_fan_speed(pct: int, gpu: int = 0):
+def set_fan_speed(pct: int, gpu: int = 0, *, execute: bool = False):
     """Set fan speed as percentage (0-100%).
 
     MULTI-METHOD FALLBACK: Tries new ClientFanCoolersSetControl first
@@ -1182,6 +1234,8 @@ def set_fan_speed(pct: int, gpu: int = 0):
     GPU, skip straight to that API to avoid the Get-Modify-Set overhead
     of the new API when it's going to fail anyway.
     """
+    require_execute(execute)
+
     # Check device cache for fan API preference
     cached_api = _get_cached_fan_api(gpu)
     if cached_api == "old":
@@ -1196,8 +1250,9 @@ def set_fan_speed(pct: int, gpu: int = 0):
         _note_fan_api("old", gpu)
 
 
-def set_fan_auto(gpu: int = 0):
+def set_fan_auto(gpu: int = 0, *, execute: bool = False):
     """Reset fan to automatic control."""
+    require_execute(execute)
     cached_api = _get_cached_fan_api(gpu)
     if cached_api == "old":
         _set_cooler_auto(cooler_index=0, gpu=gpu)
@@ -1211,7 +1266,7 @@ def set_fan_auto(gpu: int = 0):
         _note_fan_api("old", gpu)
 
 
-def reset_all(gpu: int = 0):
+def reset_all(gpu: int = 0, *, execute: bool = False):
     """Reset all OC settings to stock defaults.
 
     GRACEFUL DEGRADATION: Each reset is independent. If core reset fails,
@@ -1219,17 +1274,18 @@ def reset_all(gpu: int = 0):
     if any individual reset failed. This ensures maximum rollback even
     when some subsystems are in a bad state.
     """
+    require_execute(execute)
     errors = []
 
-    # Reset core clock offset to 0 (no overclock/undervolt)
+    # Reset core clock offset to 0 (no positive or negative offset)
     try:
-        set_core_offset(0, gpu)
+        set_core_offset(0, gpu, execute=True)
     except NvApiError as e:
         errors.append(f"core: {e}")
 
     # Reset memory clock offset to 0
     try:
-        set_mem_offset(0, gpu)
+        set_mem_offset(0, gpu, execute=True)
     except NvApiError as e:
         errors.append(f"memory: {e}")
 
@@ -1238,10 +1294,7 @@ def reset_all(gpu: int = 0):
         _, def_pcm, _ = _get_power_info(gpu)
         _set_power_status(def_pcm, gpu)
     except NvApiError as e:
-        try:
-            _set_power_status(100000, gpu)  # Fallback: 100% if we can't read default
-        except NvApiError:
-            errors.append(f"power: {e}")
+        errors.append(f"power: {e}")
 
     # Reset thermal limit to factory default
     try:
@@ -1252,7 +1305,7 @@ def reset_all(gpu: int = 0):
 
     # Reset fan to automatic control (GPU manages fan curve)
     try:
-        set_fan_auto(gpu)
+        set_fan_auto(gpu, execute=True)
     except NvApiError as e:
         errors.append(f"fan: {e}")
 

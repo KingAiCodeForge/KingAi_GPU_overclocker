@@ -13,6 +13,8 @@ venv/
 *.log
 .mypy_cache/
 .pytest_cache/
+.pytest-tmp/
+.pytest_tmp*/
 .ruff_cache/
 
 # Research notes, probe scripts, byte dumps — stay local

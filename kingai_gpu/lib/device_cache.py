@@ -29,9 +29,8 @@ Design principles:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
 
 
 # Default cache location — in user's home directory, not the repo.

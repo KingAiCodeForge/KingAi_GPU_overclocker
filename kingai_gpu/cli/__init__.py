@@ -2,6 +2,6 @@
 
 main.py      = Entry point + argument parsing
 monitor.py   = Real-time monitoring dashboard
-overclock.py = Overclock/undervolt control
+overclock.py = Clock-offset and limit planning/control (not V/F undervolting)
 memtest.py   = VRAM stability testing + memory OC sweep
 """

@@ -1,55 +1,26 @@
-"""
-VRAM stability testing and memory OC bandwidth sweep.
+"""GPU-memory test and explicitly gated memory-offset sweep.
 
-Two modes:
-  1. Pattern test — write known patterns (0x00, 0xFF, 0xAA, 0x55, walking-1,
-     random) to GPU VRAM, read back, compare. Any mismatch = VRAM error.
-     This detects data corruption from unstable memory overclocks.
-
-  2. Bandwidth sweep — at each memory OC offset step:
-     a) Set memory offset via NVAPI
-     b) Wait for clocks to settle (2 seconds)
-     c) Measure effective memory bandwidth (device-to-device copy)
-     d) Run pattern test to detect errors
-     e) Record results
-     Detects the "bandwidth cliff" where GDDR6/6X error correction
-     (ECC/EDR) kicks in and eats bandwidth even though no visible
-     artifacts appear. This is the real-world optimal OC point.
-
-Works on ALL GeForce GPUs — no ECC counter access needed (those are
-locked to Quadro/Tesla). Instead, we detect errors via:
-  - Direct pattern comparison (catches data corruption)
-  - Bandwidth regression (catches silent ECC/EDR correction overhead)
-
-Requires: numpy (always), cupy (optional, for actual GPU VRAM testing).
-Falls back to pure numpy + system RAM if cupy is unavailable (proof of concept).
+A sweep changes hardware and therefore requires ``--execute``. It also
+requires a real CUDA/CuPy backend; the NumPy fallback is system-RAM-only and is
+never accepted as sweep evidence.
 """
 
 from __future__ import annotations
 
 import sys
 import time
+import importlib
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Protocol
 
+from kingai_gpu.cli.overclock import PlanError, require_stable_identity
+from kingai_gpu.lib.backend import NvApiBackend, OcBackend, parse_pci_bdf
 from kingai_gpu.lib.nvml import snapshot
 
-
-# ── Try to import CUDA-capable libraries ──
-# CuPy = CUDA-accelerated NumPy. Required for actual VRAM testing.
-# Without CuPy, we can only test system RAM (proof of concept mode).
-# CuPy must match CUDA version: pip install cupy-cuda11x or cupy-cuda12x
-
-_HAS_CUPY = False
-_HAS_CUDA = False
-
-try:
-    import cupy as cp
-
-    _HAS_CUPY = True
-    _HAS_CUDA = True
-except ImportError:
-    cp = None
+cp = None
+_cupy_checked = False
 
 try:
     import numpy as np
@@ -57,48 +28,30 @@ except ImportError:
     np = None
 
 
-# ── Test result types ──
-# Dataclasses for structured test results. Used by CLI output,
-# future JSON export, and GUI results display.
-
 @dataclass
 class MemtestResult:
-    """Result of a single VRAM pattern test.
-
-    A test runs multiple patterns sequentially. Each pattern writes known
-    data to a VRAM buffer, reads it back, and counts mismatches.
-    errors_detected > 0 means the memory OC is unstable.
-    """
-
     timestamp: str = ""
     duration_sec: float = 0.0
     buffer_size_mb: int = 0
     patterns_tested: int = 0
     total_bytes_checked: int = 0
     errors_detected: int = 0
-    error_locations: list[int] = field(default_factory=list)
     gpu_temp: int = 0
     mem_clock: int = 0
     passed: bool = True
+    backend: str = ""
 
     def summary(self) -> str:
         status = "PASS" if self.passed else f"FAIL ({self.errors_detected} errors)"
         return (
-            f"[{self.timestamp}] {status} | "
-            f"{self.buffer_size_mb}MB × {self.patterns_tested} patterns | "
-            f"{self.duration_sec:.1f}s | "
-            f"{self.gpu_temp}°C | {self.mem_clock} MHz"
+            f"[{self.timestamp}] {status} | {self.buffer_size_mb}MB x "
+            f"{self.patterns_tested} patterns | {self.duration_sec:.1f}s | "
+            f"{self.backend} | {self.gpu_temp}C | {self.mem_clock} MHz"
         )
 
 
 @dataclass
 class BandwidthResult:
-    """Result of a bandwidth measurement at one memory OC point.
-
-    Used by the sweep to track how effective memory bandwidth changes
-    as the memory clock offset increases.
-    """
-
     mem_offset_mhz: int = 0
     bandwidth_gbps: float = 0.0
     errors: int = 0
@@ -109,278 +62,254 @@ class BandwidthResult:
 
 @dataclass
 class SweepResult:
-    """Full memory OC sweep result.
-
-    Contains all bandwidth measurements, the optimal offset found,
-    and the cliff/crash points if detected. The summary() method
-    produces a formatted table for terminal display.
-    """
-
     gpu_name: str = ""
     timestamp: str = ""
     results: list[BandwidthResult] = field(default_factory=list)
     optimal_offset_mhz: int = 0
     peak_bandwidth_gbps: float = 0.0
-    cliff_offset_mhz: int = -1  # -1 = no cliff detected — BW never decreased
-    crash_offset_mhz: int = -1  # -1 = no crash — all steps completed
+    cliff_offset_mhz: int = -1
+    crash_offset_mhz: int = -1
 
     def summary(self) -> str:
         lines = [
-            f"═══ Memory OC Sweep: {self.gpu_name} ═══",
-            f"  Timestamp:         {self.timestamp}",
-            f"  Optimal offset:    +{self.optimal_offset_mhz} MHz",
-            f"  Peak bandwidth:    {self.peak_bandwidth_gbps:.1f} GB/s",
+            f"Memory sweep: {self.gpu_name}",
+            f"  Timestamp: {self.timestamp}",
+            f"  Best measured offset: {self.optimal_offset_mhz:+d} MHz",
+            f"  Peak measured bandwidth: {self.peak_bandwidth_gbps:.1f} GB/s",
         ]
         if self.cliff_offset_mhz >= 0:
-            lines.append(f"  Bandwidth cliff:   +{self.cliff_offset_mhz} MHz (corrections eating BW)")
-        if self.crash_offset_mhz >= 0:
-            lines.append(f"  Crash point:       +{self.crash_offset_mhz} MHz")
-        lines.append("")
-        lines.append(f"  {'Offset':>8}  {'BW (GB/s)':>10}  {'Errors':>7}  {'Temp':>5}  {'Clock':>7}  {'Power':>7}")
-        lines.append(f"  {'─'*8}  {'─'*10}  {'─'*7}  {'─'*5}  {'─'*7}  {'─'*7}")
-        for r in self.results:
-            marker = ""
-            if r.mem_offset_mhz == self.optimal_offset_mhz:
-                marker = " ← OPTIMAL"
-            if r.mem_offset_mhz == self.cliff_offset_mhz:
-                marker = " ← CLIFF"
-            if r.errors > 0:
-                marker = f" ← {r.errors} ERRORS"
             lines.append(
-                f"  {'+' + str(r.mem_offset_mhz):>8}  "
-                f"{r.bandwidth_gbps:>10.1f}  "
-                f"{r.errors:>7}  "
-                f"{r.gpu_temp:>4}°  "
-                f"{r.mem_clock:>6}M  "
-                f"{r.power_draw:>5.0f}W"
-                f"{marker}"
+                f"  First >2% step regression: {self.cliff_offset_mhz:+d} MHz "
+                "(observation, not proof of error correction)"
+            )
+        if self.crash_offset_mhz >= 0:
+            lines.append(f"  Failed test point: {self.crash_offset_mhz:+d} MHz")
+        for result in self.results:
+            lines.append(
+                f"  {result.mem_offset_mhz:+6d} MHz  "
+                f"{result.bandwidth_gbps:8.1f} GB/s  "
+                f"errors={result.errors} temp={result.gpu_temp}C "
+                f"clock={result.mem_clock}MHz power={result.power_draw:.0f}W"
             )
         return "\n".join(lines)
 
 
-# ── VRAM pattern tests (CuPy GPU-accelerated) ──
-# These patterns are chosen to stress different failure modes:
-#   all_zeros/ones  — stuck-at faults (bit permanently 0 or 1)
-#   checkerboard    — adjacent-cell coupling (bit influenced by neighbor)
-#   walking_1       — single-bit sensitivity (each bit position tested alone)
-#   random          — general data integrity (catches pattern-dependent faults)
+class GpuMemoryBackend(Protocol):
+    """A workload whose buffers and verification execute in GPU memory."""
 
-PATTERNS = [
-    ("all_zeros", 0x00),      # Every bit = 0
-    ("all_ones", 0xFF),       # Every bit = 1
-    ("checkerboard_A", 0xAA), # Alternating 10101010
-    ("checkerboard_5", 0x55), # Alternating 01010101 (inverse of above)
-    ("walking_1", None),      # Special: shifts a single 1 through all 32 positions
-    ("random", None),         # Special: random data (catches pattern-dependent faults)
-]
+    is_gpu_memory: bool
+
+    def pci_bus_id(self, gpu_index: int) -> str: ...
+
+    def measure(self, size_mb: int, iterations: int, gpu_index: int) -> float: ...
+
+    def test(
+        self,
+        size_mb: int,
+        gpu_index: int,
+        duration_sec: float = 0,
+    ) -> MemtestResult: ...
 
 
-def _run_pattern_test_cupy(size_mb: int = 256, gpu_index: int = 0) -> MemtestResult:
-    """GPU-accelerated VRAM pattern test using CuPy.
+class CupyMemoryBackend:
+    """CUDA-backed memory copy and deterministic pattern verification."""
 
-    For each pattern:
-      1. Allocate CuPy array on GPU VRAM (uint32 for efficiency)
-      2. Fill with pattern value
-      3. Force CUDA sync (ensures write is complete)
-      4. Copy buffer to a second GPU array
-      5. Compare original vs copy element-wise
-      6. Count mismatches (any mismatch = VRAM corruption)
+    is_gpu_memory = True
+    _PATTERNS = (0x00000000, 0xFFFFFFFF, 0xAAAAAAAA, 0x55555555)
 
-    The walking_1 pattern runs 32 sub-tests (one per bit position).
-    Total VRAM usage: ~2x size_mb during each pattern test.
-    """
-    result = MemtestResult(
-        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        buffer_size_mb=size_mb,
-    )
-    t0 = time.perf_counter()
-    size_bytes = size_mb * 1024 * 1024
-    size_u32 = size_bytes // 4  # Work in uint32 for efficiency
+    def _device(self, gpu_index: int):
+        return cp.cuda.Device(gpu_index)
 
-    total_errors = 0
-    patterns_run = 0
+    def pci_bus_id(self, gpu_index: int) -> str:
+        """Return CUDA's stable PCI identity for the selected device ordinal."""
 
-    for name, value in PATTERNS:
+        value = cp.cuda.runtime.deviceGetPCIBusId(gpu_index)
+        return value.decode("ascii", errors="strict") if isinstance(value, bytes) else str(value)
+
+    def measure(self, size_mb: int, iterations: int, gpu_index: int) -> float:
+        count = size_mb * 1024 * 1024
+        with self._device(gpu_index):
+            source = cp.arange(count, dtype=cp.uint8)
+            target = cp.empty_like(source)
+            for _ in range(3):
+                cp.copyto(target, source)
+            cp.cuda.runtime.deviceSynchronize()
+            started = time.perf_counter()
+            for _ in range(iterations):
+                cp.copyto(target, source)
+            cp.cuda.runtime.deviceSynchronize()
+            elapsed = time.perf_counter() - started
+            del source, target
+            cp.get_default_memory_pool().free_all_blocks()
+        return (count * iterations * 2) / elapsed / 1e9
+
+    def test(
+        self,
+        size_mb: int,
+        gpu_index: int,
+        duration_sec: float = 0,
+    ) -> MemtestResult:
+        if duration_sec < 0:
+            raise PlanError("GPU-memory test duration must not be negative")
+        count = size_mb * 1024 * 1024 // 4
+        result = MemtestResult(
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+            buffer_size_mb=size_mb,
+            backend="cupy-cuda-vram",
+        )
+        started = time.perf_counter()
+        deadline = started + duration_sec
+        with self._device(gpu_index):
+            buffer = cp.empty(count, dtype=cp.uint32)
+            errors = 0
+            while result.patterns_tested == 0 or time.perf_counter() < deadline:
+                for pattern in self._PATTERNS:
+                    buffer.fill(pattern)
+                    cp.cuda.runtime.deviceSynchronize()
+                    errors += int(cp.count_nonzero(buffer != cp.uint32(pattern)).get())
+                    result.patterns_tested += 1
+                    if errors:
+                        break
+                if errors:
+                    break
+            result.total_bytes_checked = size_mb * 1024 * 1024 * result.patterns_tested
+            result.errors_detected = errors
+            result.passed = errors == 0
+            del buffer
+            cp.get_default_memory_pool().free_all_blocks()
+        result.duration_sec = time.perf_counter() - started
         try:
-            if name == "walking_1":
-                # Walk a 1 bit through each 32-bit word position
-                for bit in range(32):
-                    pattern_val = 1 << bit
-                    buf = cp.full(size_u32, pattern_val, dtype=cp.uint32)
-                    cp.cuda.runtime.deviceSynchronize()
-                    readback = buf.copy()
-                    cp.cuda.runtime.deviceSynchronize()
-                    mismatches = int(cp.sum(buf != readback))
-                    total_errors += mismatches
-                    del buf, readback
-                patterns_run += 32
-
-            elif name == "random":
-                # Write random data, read back, compare
-                buf = cp.random.randint(0, 0xFFFFFFFF, size=size_u32, dtype=cp.uint32)
-                cp.cuda.runtime.deviceSynchronize()
-                expected = buf.copy()
-                cp.cuda.runtime.deviceSynchronize()
-                # Read back original buffer
-                mismatches = int(cp.sum(buf != expected))
-                total_errors += mismatches
-                del buf, expected
-                patterns_run += 1
-
-            else:
-                # Fixed-value pattern
-                fill_val = value | (value << 8) | (value << 16) | (value << 24)
-                buf = cp.full(size_u32, fill_val, dtype=cp.uint32)
-                cp.cuda.runtime.deviceSynchronize()
-                readback = buf.copy()
-                cp.cuda.runtime.deviceSynchronize()
-                mismatches = int(cp.sum(buf != readback))
-                total_errors += mismatches
-                del buf, readback
-                patterns_run += 1
-
-        except Exception as e:
-            print(f"  Pattern '{name}' failed: {e}")
-            continue
-
-    # Force CUDA sync and cleanup
-    cp.cuda.runtime.deviceSynchronize()
-    cp.get_default_memory_pool().free_all_blocks()
-
-    result.duration_sec = time.perf_counter() - t0
-    result.patterns_tested = patterns_run
-    result.total_bytes_checked = size_bytes * patterns_run
-    result.errors_detected = total_errors
-    result.passed = total_errors == 0
-
-    # Grab GPU state
-    try:
-        s = snapshot(gpu_index)
-        result.gpu_temp = s.temp_gpu
-        result.mem_clock = s.clock_mem
-    except Exception:
-        pass
-
-    return result
-
-
-def _run_pattern_test_numpy(size_mb: int = 256, gpu_index: int = 0) -> MemtestResult:
-    """CPU-based fallback VRAM pattern test (system RAM only).
-
-    This does NOT actually test VRAM — it's a proof-of-concept that runs
-    the same pattern logic on system RAM via numpy. Useful for testing
-    the test harness itself without a CUDA-capable GPU.
-
-    Walking_1 and random patterns are skipped in fallback mode to keep
-    runtime reasonable on CPU.
-    """
-    result = MemtestResult(
-        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        buffer_size_mb=size_mb,
-    )
-    t0 = time.perf_counter()
-    size_bytes = size_mb * 1024 * 1024
-
-    if np is None:
-        result.passed = False
-        result.errors_detected = -1
+            state = snapshot(gpu_index)
+            result.gpu_temp = state.temp_gpu
+            result.mem_clock = state.clock_mem
+        except Exception:
+            pass
         return result
 
-    total_errors = 0
-    patterns_run = 0
 
-    for name, value in PATTERNS:
-        if name == "walking_1" or name == "random":
-            continue  # Skip complex patterns in fallback mode
-        buf = np.full(size_bytes, value, dtype=np.uint8)
-        readback = buf.copy()
-        mismatches = int(np.sum(buf != readback))
-        total_errors += mismatches
-        patterns_run += 1
-        del buf, readback
+def get_gpu_memory_backend(gpu_index: int = 0) -> GpuMemoryBackend | None:
+    """Return CuPy only after a live CUDA device check succeeds."""
 
-    result.duration_sec = time.perf_counter() - t0
-    result.patterns_tested = patterns_run
-    result.total_bytes_checked = size_bytes * patterns_run
-    result.errors_detected = total_errors
-    result.passed = total_errors == 0
-
+    global cp, _cupy_checked
+    if not _cupy_checked:
+        _cupy_checked = True
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cp = importlib.import_module("cupy")
+        except (ImportError, OSError):
+            cp = None
+    if cp is None:
+        return None
     try:
-        s = snapshot(gpu_index)
-        result.gpu_temp = s.temp_gpu
-        result.mem_clock = s.clock_mem
+        if gpu_index < 0 or cp.cuda.runtime.getDeviceCount() <= gpu_index:
+            return None
+        with cp.cuda.Device(gpu_index):
+            cp.cuda.runtime.deviceSynchronize()
+    except Exception:
+        return None
+    return CupyMemoryBackend()
+
+
+def _run_system_ram_fallback(size_mb: int, gpu_index: int) -> MemtestResult:
+    """Clearly labelled development fallback; this does not test VRAM."""
+
+    if np is None:
+        raise RuntimeError("NumPy is required for the system-RAM fallback")
+    count = size_mb * 1024 * 1024 // 4
+    result = MemtestResult(
+        timestamp=datetime.now().isoformat(timespec="seconds"),
+        buffer_size_mb=size_mb,
+        backend="numpy-system-ram",
+    )
+    started = time.perf_counter()
+    buffer = np.empty(count, dtype=np.uint32)
+    errors = 0
+    for pattern in CupyMemoryBackend._PATTERNS:
+        buffer.fill(pattern)
+        errors += int(np.count_nonzero(buffer != np.uint32(pattern)))
+    result.patterns_tested = len(CupyMemoryBackend._PATTERNS)
+    result.total_bytes_checked = size_mb * 1024 * 1024 * result.patterns_tested
+    result.errors_detected = errors
+    result.passed = errors == 0
+    result.duration_sec = time.perf_counter() - started
+    try:
+        state = snapshot(gpu_index)
+        result.gpu_temp = state.temp_gpu
+        result.mem_clock = state.clock_mem
     except Exception:
         pass
-
     return result
 
 
 def run_memtest(size_mb: int = 256, gpu_index: int = 0) -> MemtestResult:
-    """Run VRAM pattern test. Auto-selects CuPy (GPU) or numpy (CPU) backend."""
-    if _HAS_CUPY:
-        return _run_pattern_test_cupy(size_mb, gpu_index)
-    else:
-        print("Warning: CuPy not installed. Running CPU-only fallback (tests system RAM, not VRAM).")
-        print("Install CuPy for actual VRAM testing: pip install cupy-cuda12x")
-        return _run_pattern_test_numpy(size_mb, gpu_index)
+    if size_mb <= 0:
+        raise PlanError("Buffer size must be greater than zero")
+    backend = get_gpu_memory_backend(gpu_index)
+    if backend is not None:
+        return backend.test(size_mb, gpu_index)
+    return _run_system_ram_fallback(size_mb, gpu_index)
 
 
-# ── Bandwidth measurement ──
-# Measures effective GPU memory bandwidth by timing device-to-device copies.
-# This is the key metric for detecting the ECC/EDR bandwidth cliff.
+def validate_sweep(
+    start_mhz: int,
+    stop_mhz: int,
+    step_mhz: int,
+    test_duration: int,
+    size_mb: int,
+    live_state,
+) -> None:
+    """Reject unsafe sweep parameters before the first write call."""
 
-def measure_bandwidth(size_mb: int = 256, iterations: int = 50) -> float:
-    """Measure GPU memory bandwidth in GB/s using device-to-device copy.
-
-    Methodology:
-      1. Allocate src + dst buffers on GPU VRAM
-      2. Warm up (5 copies to stabilize clocks + caches)
-      3. Time N iterations of src->dst copy
-      4. Calculate: bandwidth = (bytes × iterations × 2) / elapsed
-         The ×2 accounts for both read (from src) and write (to dst).
-
-    Returns effective bandwidth in GB/s. Typical values:
-      - RTX 3080 stock: ~750-760 GB/s
-      - RTX 3080 +1000 MHz mem: ~820-850 GB/s (before cliff)
-      - RTX 3080 +1200 MHz mem: ~800 GB/s (cliff — ECC eating BW)
-    """
-    if not _HAS_CUPY:
-        print("Error: CuPy required for bandwidth measurement. pip install cupy-cuda12x")
-        return 0.0
-
-    size_bytes = size_mb * 1024 * 1024
-
-    # Allocate two buffers
-    src = cp.random.randint(0, 255, size=size_bytes, dtype=cp.uint8)
-    dst = cp.zeros(size_bytes, dtype=cp.uint8)
-    cp.cuda.runtime.deviceSynchronize()
-
-    # Warm up
-    for _ in range(5):
-        cp.copyto(dst, src)
-    cp.cuda.runtime.deviceSynchronize()
-
-    # Timed run
-    t0 = time.perf_counter()
-    for _ in range(iterations):
-        cp.copyto(dst, src)
-    cp.cuda.runtime.deviceSynchronize()
-    elapsed = time.perf_counter() - t0
-
-    # Bandwidth = (bytes read + bytes written) / time
-    # Each copy reads src and writes dst, so total data moved = 2× size
-    bw_bytes = size_bytes * iterations * 2
-    bw_gbps = bw_bytes / elapsed / 1e9
-
-    del src, dst
-    cp.get_default_memory_pool().free_all_blocks()
-
-    return bw_gbps
+    require_stable_identity(live_state.identity)
+    if "mem_offset_mhz" not in live_state.valid_settings:
+        raise PlanError(
+            "Selected GPU memory-offset read/range is unavailable; refusing to "
+            "sweep using guessed state"
+        )
+    if step_mhz <= 0:
+        raise PlanError("Sweep step must be greater than zero")
+    if start_mhz > stop_mhz:
+        raise PlanError("Sweep start must not exceed sweep stop")
+    if test_duration <= 0:
+        raise PlanError("Sweep duration must be greater than zero")
+    if size_mb <= 0:
+        raise PlanError("Sweep buffer size must be greater than zero")
+    minimum, maximum = live_state.mem_offset_range_mhz
+    if start_mhz < minimum or stop_mhz > maximum:
+        raise PlanError(
+            f"Sweep [{start_mhz}, {stop_mhz}] MHz is outside the selected GPU "
+            f"range [{minimum:g}, {maximum:g}]"
+        )
 
 
-# ── Memory OC sweep ──
-# The flagship feature — automated memory overclock optimization.
-# Walks through offset range, measuring bandwidth and errors at each step.
+def validate_memory_backend_identity(
+    memory_backend: GpuMemoryBackend,
+    gpu_index: int,
+    live_state,
+) -> None:
+    """Require CUDA and the OC backend to resolve to the same PCI function."""
+
+    identity_reader = getattr(memory_backend, "pci_bus_id", None)
+    if not callable(identity_reader):
+        raise PlanError("GPU-memory backend does not expose a PCI bus identity")
+    try:
+        memory_bus_id = identity_reader(gpu_index)
+    except Exception as exc:
+        raise PlanError(f"Unable to read GPU-memory backend PCI identity: {exc}") from exc
+    memory_bdf = parse_pci_bdf(str(memory_bus_id))
+    selected_bdf = parse_pci_bdf(str(live_state.identity.pci_bus_id))
+    if memory_bdf is None or selected_bdf is None:
+        raise PlanError(
+            "CUDA and OC backends must both expose complete PCI "
+            "domain:bus:device.function identities"
+        )
+    if memory_bdf != selected_bdf:
+        raise PlanError(
+            f"GPU-memory backend PCI {memory_bus_id!r} does not match selected "
+            f"GPU PCI {live_state.identity.pci_bus_id!r}"
+        )
+
 
 def run_sweep(
     start_mhz: int = 0,
@@ -389,211 +318,209 @@ def run_sweep(
     test_duration: int = 10,
     size_mb: int = 256,
     gpu_index: int = 0,
+    *,
+    execute: bool = False,
+    backend: OcBackend | None = None,
+    memory_backend: GpuMemoryBackend | None = None,
+    settle_seconds: float = 2.0,
+    sensor_reader=None,
 ) -> SweepResult:
-    """
-    Automated memory OC sweep — finds optimal offset before bandwidth cliff.
+    """Execute a validated sweep and always restore the exact prior offset."""
 
-    At each step:
-    1. Set memory offset via NVAPI (nvapi.set_mem_offset)
-    2. Wait 2s for GPU clocks to settle at new frequency
-    3. Measure bandwidth (device-to-device copy throughput)
-    4. Run pattern test (write/read/compare known patterns)
-    5. Record results (BW, errors, temp, clock, power)
+    if not execute:
+        raise PlanError("Memory sweep requires explicit execute=True / --execute")
+    if memory_backend is None or not getattr(memory_backend, "is_gpu_memory", False):
+        raise PlanError("Memory sweep requires a genuine GPU-memory backend")
 
-    Detects three key points:
-    - OPTIMAL: highest BW with zero errors (this is your best OC)
-    - CLIFF: BW decreased >2% from previous step (ECC/EDR kicking in)
-    - CRASH: exception during test (GPU driver recovery or hang)
-
-    SAFETY: Always resets memory offset to +0 in the finally block,
-    even on crash or Ctrl+C. If the reset itself fails, prints a
-    manual reset command for the user.
-    """
-    try:
-        from kingai_gpu.lib.nvapi import (
-            NvApiError,
-            enable_oc,
-            set_mem_offset,
-        )
-    except ImportError:
-        print("Error: NVAPI required for memory OC sweep (Windows only)")
-        return SweepResult()
-
-    sweep = SweepResult(
-        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    selected = backend or NvApiBackend()
+    live = selected.get_state(gpu_index)
+    validate_sweep(start_mhz, stop_mhz, step_mhz, test_duration, size_mb, live)
+    validate_memory_backend_identity(memory_backend, gpu_index, live)
+    prior_offset = live.mem_offset_mhz
+    read_sensors = sensor_reader or snapshot
+    result = SweepResult(
+        gpu_name=live.identity.name,
+        timestamp=datetime.now().isoformat(timespec="seconds"),
+        optimal_offset_mhz=int(prior_offset),
     )
-
-    # Get GPU name
-    s = snapshot(gpu_index)
-    sweep.gpu_name = s.name
-
-    try:
-        enable_oc(gpu_index)
-    except NvApiError as e:
-        print(f"Failed to enable OC: {e}")
-        return sweep
-
-    peak_bw = 0.0
-    peak_offset = 0
-    prev_bw = 0.0
+    peak_bandwidth = 0.0
+    previous_bandwidth = 0.0
+    restore_error: Exception | None = None
+    offset_write_attempted = False
 
     try:
+        selected.prepare_write(gpu_index, execute=True)
         for offset in range(start_mhz, stop_mhz + 1, step_mhz):
-            print(f"\n  Testing +{offset} MHz...", end=" ", flush=True)
-
-            # Set memory offset
+            print(f"Testing {offset:+d} MHz...", end=" ", flush=True)
             try:
-                set_mem_offset(offset, gpu_index)
-            except NvApiError as e:
-                print(f"NVAPI error: {e}")
-                sweep.crash_offset_mhz = offset
+                offset_write_attempted = True
+                selected.set_setting(
+                    "mem_offset_mhz",
+                    offset,
+                    gpu_index,
+                    execute=True,
+                )
+                observed = selected.get_state(gpu_index)
+                if (
+                    "mem_offset_mhz" not in observed.valid_settings
+                    or abs(float(observed.mem_offset_mhz) - offset) > 0.01
+                ):
+                    raise RuntimeError(
+                        "memory-offset read-back did not confirm "
+                        f"{offset:+d} MHz (observed {observed.mem_offset_mhz!r})"
+                    )
+                if settle_seconds > 0:
+                    time.sleep(settle_seconds)
+                bandwidth = memory_backend.measure(
+                    size_mb=size_mb,
+                    iterations=max(10, test_duration * 5),
+                    gpu_index=gpu_index,
+                )
+                tested = memory_backend.test(
+                    size_mb=size_mb,
+                    gpu_index=gpu_index,
+                    duration_sec=test_duration,
+                )
+                sensors = read_sensors(gpu_index)
+            except Exception as exc:
+                result.crash_offset_mhz = offset
+                print(f"FAILED: {exc}")
                 break
 
-            # Wait for clocks to settle
-            time.sleep(2)
-
-            # Measure bandwidth
-            try:
-                bw = measure_bandwidth(size_mb=size_mb, iterations=max(10, test_duration * 5))
-            except Exception as e:
-                print(f"CRASH during bandwidth test: {e}")
-                sweep.crash_offset_mhz = offset
-                break
-
-            # Run pattern test
-            try:
-                mt = run_memtest(size_mb=size_mb, gpu_index=gpu_index)
-                errors = mt.errors_detected
-            except Exception as e:
-                print(f"CRASH during pattern test: {e}")
-                sweep.crash_offset_mhz = offset
-                break
-
-            # Read GPU state
-            gs = snapshot(gpu_index)
-
-            result = BandwidthResult(
+            point = BandwidthResult(
                 mem_offset_mhz=offset,
-                bandwidth_gbps=bw,
-                errors=errors,
-                gpu_temp=gs.temp_gpu,
-                mem_clock=gs.clock_mem,
-                power_draw=gs.power_draw,
+                bandwidth_gbps=bandwidth,
+                errors=tested.errors_detected,
+                gpu_temp=sensors.temp_gpu,
+                mem_clock=sensors.clock_mem,
+                power_draw=sensors.power_draw,
             )
-            sweep.results.append(result)
+            result.results.append(point)
+            print(f"{bandwidth:.1f} GB/s, errors={tested.errors_detected}")
 
-            print(f"{bw:.1f} GB/s  {errors} errors  {gs.temp_gpu}°C  {gs.clock_mem}MHz", flush=True)
-
-            # Track peak — best BW with zero errors = optimal OC point
-            if bw > peak_bw and errors == 0:
-                peak_bw = bw
-                peak_offset = offset
-
-            # Detect bandwidth cliff: BW dropped >2% from previous step.
-            # This means GDDR6/6X error correction is consuming bandwidth
-            # even though no visible errors appear. The GPU is silently
-            # correcting bit errors, which costs memory controller cycles.
-            if prev_bw > 0 and bw < prev_bw * 0.98 and sweep.cliff_offset_mhz < 0:
-                sweep.cliff_offset_mhz = offset
-
-            # Stop on pattern errors — visible corruption means OC is WAY too high.
-            # No point testing further, and continuing risks driver crash.
-            if errors > 0:
-                print(f"\n  ⚠ Errors detected at +{offset} MHz. Stopping sweep.")
+            if tested.errors_detected == 0 and bandwidth > peak_bandwidth:
+                peak_bandwidth = bandwidth
+                result.optimal_offset_mhz = offset
+            if (
+                previous_bandwidth > 0
+                and bandwidth < previous_bandwidth * 0.98
+                and result.cliff_offset_mhz < 0
+            ):
+                result.cliff_offset_mhz = offset
+            if tested.errors_detected:
                 break
-
-            prev_bw = bw
-
+            previous_bandwidth = bandwidth
     except KeyboardInterrupt:
-        print("\n\nSweep interrupted by user.")
-
+        print("Sweep interrupted.", file=sys.stderr)
     finally:
-        # CRITICAL SAFETY: Always reset memory offset to stock.
-        # Even if the test crashed, we MUST undo the OC to prevent
-        # the user's GPU from running at an unstable memory clock.
-        print("\n  Resetting memory offset to +0 MHz...", end=" ")
-        try:
-            set_mem_offset(0, gpu_index)
-            print("done.")
-        except Exception as e:
-            print(f"WARNING: Failed to reset: {e}")
-            print("  ⚠ MANUALLY RESET YOUR MEMORY OFFSET! Run: kingai-gpu oc --mem 0")
+        if offset_write_attempted:
+            try:
+                selected.set_setting(
+                    "mem_offset_mhz",
+                    prior_offset,
+                    gpu_index,
+                    execute=True,
+                )
+                restored = selected.get_state(gpu_index)
+                if (
+                    "mem_offset_mhz" not in restored.valid_settings
+                    or abs(float(restored.mem_offset_mhz) - float(prior_offset)) > 0.01
+                ):
+                    raise RuntimeError(
+                        f"restore read-back observed {restored.mem_offset_mhz!r} MHz"
+                    )
+            except Exception as exc:
+                restore_error = exc
 
-    sweep.optimal_offset_mhz = peak_offset
-    sweep.peak_bandwidth_gbps = peak_bw
+    result.peak_bandwidth_gbps = peak_bandwidth
+    if restore_error is not None:
+        raise RuntimeError(
+            f"Could not restore exact prior memory offset {prior_offset:+g} MHz: "
+            f"{restore_error}"
+        ) from restore_error
+    return result
 
-    return sweep
 
-
-# ── CLI command handler ──
-# Entry point called from cli/main.py. Dispatches to sweep or pattern test.
-
-def cmd_memtest(args) -> int:
-    """Handle the 'memtest' subcommand.
-
-    Two modes:
-      --sweep: Run automated memory OC sweep (requires NVAPI + CuPy)
-      (default): Run single/repeated pattern test at current OC setting
-    """
-
-    print(f"KingAi GPU Memory Stability Tester")
-    print(f"{'═' * 40}")
-
-    if not _HAS_CUPY:
-        print()
-        print("⚠ CuPy not installed — VRAM tests will use CPU fallback (less accurate)")
-        print("  Install for real VRAM testing: pip install cupy-cuda12x")
-        print()
+def cmd_memtest(
+    args,
+    backend: OcBackend | None = None,
+    memory_backend: GpuMemoryBackend | None = None,
+) -> int:
+    """Run a read-only test or an explicitly executed changing sweep."""
 
     gpu = args.gpu
+    if gpu < 0:
+        print("GPU index must not be negative.", file=sys.stderr)
+        return 2
+    if args.duration <= 0 or args.size <= 0:
+        print("Duration and buffer size must be greater than zero.", file=sys.stderr)
+        return 2
 
     if args.sweep:
-        # Automated memory OC sweep
-        print(f"\nStarting memory OC sweep on GPU {gpu}")
-        print(f"  Range: +{args.start} to +{args.stop} MHz (step {args.step})")
-        print(f"  Duration per step: {args.duration}s")
-        print(f"  Buffer size: {args.size} MB")
-        print(f"  Press Ctrl+C to stop safely\n")
+        gpu_memory = memory_backend or get_gpu_memory_backend(gpu)
+        if gpu_memory is None or not getattr(gpu_memory, "is_gpu_memory", False):
+            print(
+                "Sweep refused: a working CuPy/CUDA GPU-memory backend is required. "
+                "No offset was changed.",
+                file=sys.stderr,
+            )
+            return 2
+        selected = backend or NvApiBackend()
+        try:
+            live = selected.get_state(gpu)
+            validate_sweep(
+                args.start,
+                args.stop,
+                args.step,
+                args.duration,
+                args.size,
+                live,
+            )
+            validate_memory_backend_identity(gpu_memory, gpu, live)
+        except Exception as exc:
+            print(f"Sweep refused before hardware access: {exc}", file=sys.stderr)
+            return 2
 
-        result = run_sweep(
-            start_mhz=args.start,
-            stop_mhz=args.stop,
-            step_mhz=args.step,
-            test_duration=args.duration,
-            size_mb=args.size,
-            gpu_index=gpu,
+        if not args.execute:
+            print(f"PLAN ONLY — memory sweep on GPU {gpu}: {live.identity.name}")
+            print(f"  Range: {args.start:+d} to {args.stop:+d} MHz, step {args.step} MHz")
+            print(f"  Exact offset to restore: {live.mem_offset_mhz:+g} MHz")
+            print(f"  GPU-memory backend: {type(gpu_memory).__name__}")
+            print("No hardware changes made. Re-run with --execute to run the sweep.")
+            return 0
+
+        try:
+            sweep = run_sweep(
+                start_mhz=args.start,
+                stop_mhz=args.stop,
+                step_mhz=args.step,
+                test_duration=args.duration,
+                size_mb=args.size,
+                gpu_index=gpu,
+                execute=True,
+                backend=selected,
+                memory_backend=gpu_memory,
+            )
+        except Exception as exc:
+            print(f"Sweep failed: {exc}", file=sys.stderr)
+            return 1
+        print(sweep.summary())
+        return 0 if sweep.crash_offset_mhz < 0 else 1
+
+    if get_gpu_memory_backend(gpu) is None:
+        print(
+            "CuPy/CUDA unavailable: this run tests system RAM only, not GPU VRAM.",
+            file=sys.stderr,
         )
-
-        print(f"\n{result.summary()}")
-        return 0
-
-    else:
-        # Single/repeated pattern test — runs at current OC setting.
-        # Keeps running until --duration elapsed or errors found.
-        print(f"\nRunning VRAM pattern test on GPU {gpu}")
-        print(f"  Buffer size: {args.size} MB")
-        print(f"  Duration target: {args.duration}s\n")
-
-        # Run multiple iterations for the target duration.
-        # Each run_memtest() call does all patterns once (~1-3 seconds).
-        # We loop until the time budget is exhausted or errors are found.
-        t0 = time.time()
-        total_errors = 0
-        iterations = 0
-
-        while time.time() - t0 < args.duration:
-            r = run_memtest(size_mb=args.size, gpu_index=gpu)
-            total_errors += r.errors_detected
-            iterations += 1
-            print(f"  {r.summary()}")
-            if r.errors_detected > 0:
-                break
-
-        elapsed = time.time() - t0
-        print(f"\n{'═' * 40}")
-        print(f"  Iterations:  {iterations}")
-        print(f"  Total time:  {elapsed:.1f}s")
-        print(f"  Total errors: {total_errors}")
-        print(f"  Result:      {'PASS ✓' if total_errors == 0 else 'FAIL ✗'}")
-
-        return 0 if total_errors == 0 else 1
+    started = time.time()
+    errors = 0
+    iterations = 0
+    while time.time() - started < args.duration:
+        tested = run_memtest(size_mb=args.size, gpu_index=gpu)
+        print(tested.summary())
+        errors += tested.errors_detected
+        iterations += 1
+        if tested.errors_detected:
+            break
+    print(f"Iterations={iterations} errors={errors}")
+    return 0 if errors == 0 else 1
