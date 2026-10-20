@@ -14,7 +14,7 @@ left unreviewed; explicitly excluded paths/features follow the table.
 | `kingai_gpu/__init__.py` | yes; package version | 0.2.1rc1 | installed metadata/version agree |
 | `kingai_gpu/__main__.py` | yes; module launcher | added | installed module help/version outside checkout |
 | `kingai_gpu/cli/__init__.py` | yes; module descriptions | no | package import; no runtime behavior |
-| `kingai_gpu/cli/main.py` | yes; parser, dispatch, logging | version, stream restoration/close, dependency/I/O diagnostics | all command help; repeated main calls, Unicode log paths, missing runtime dependency; no hardware dispatch |
+| `kingai_gpu/cli/main.py` | yes; parser, dispatch, logging | version, stream restoration/close, optional log failure handling, dependency/I/O diagnostics | all command help; repeated main calls, disk-full write/flush, Unicode log paths, missing runtime dependency; no hardware dispatch |
 | `kingai_gpu/cli/monitor.py` | yes; render/format/poll/error paths | finite interval validation | synthetic JSON/CSV, interrupt, invalid index/interval and driver errors; no physical sensor reading |
 | `kingai_gpu/cli/overclock.py` | yes; identity/schema/ranges, transactions | no | fake plan/execute/readback/reset/rollback, invalid profile, exclusive save; actual driver behavior untested |
 | `kingai_gpu/cli/import_msi_profile_single.py` | yes; discovery/parsing/identity/import | no | synthetic profiles, BDF/device/subsystem mismatch, no overwrite, missing path/list; registry discovery and real profile import untested |

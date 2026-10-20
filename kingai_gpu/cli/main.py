@@ -39,18 +39,30 @@ from kingai_gpu import __version__
 # ── Logging tee ─────────────────────────────────────────────────────────────
 class _Tee:
     """Write to both a file and the original stream."""
-    def __init__(self, stream, log_file):
+    def __init__(self, stream, log_file, diagnostic_stream=None):
         self._stream = stream
         self._log = log_file
+        self._diagnostic_stream = diagnostic_stream
+        self._log_failed = False
+
+    def _mirror(self, operation, *args):
+        if self._log_failed:
+            return
+        try:
+            operation(*args)
+        except OSError as exc:
+            self._log_failed = True
+            if self._diagnostic_stream is not None:
+                self._diagnostic_stream.write(f"Warning: diagnostic log disabled: {exc}\n")
 
     def write(self, data):
         written = self._stream.write(data)
-        self._log.write(data)
+        self._mirror(self._log.write, data)
         return written
 
     def flush(self):
         self._stream.flush()
-        self._log.flush()
+        self._mirror(self._log.flush)
 
     def __getattr__(self, name):
         return getattr(self._stream, name)
@@ -77,8 +89,9 @@ def _init_log(command: str) -> str:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     log_path = logs_dir / f"{command}_{stamp}.log"
     log_file = open(log_path, "x", encoding="utf-8")
-    sys.stdout = _Tee(sys.stdout, log_file)
-    sys.stderr = _Tee(sys.stderr, log_file)
+    diagnostic_stream = sys.stderr
+    sys.stdout = _Tee(sys.stdout, log_file, diagnostic_stream)
+    sys.stderr = _Tee(sys.stderr, log_file, diagnostic_stream)
     return str(log_path)
 
 

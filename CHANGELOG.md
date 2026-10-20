@@ -6,7 +6,8 @@
   silently requesting a manual zero-percent fan target. Tested with mocked APIs.
 - Refuse to treat an unavailable PCI bus read as real bus zero.
 - Add installed module launching/version output, restore redirected streams and
-  close each command's diagnostic log, and report missing dependencies cleanly.
+  close each command's diagnostic log, tolerate failed optional log writes, and
+  report missing dependencies cleanly.
 - Reject non-finite monitoring intervals before NVML and contain memory-workload
   failures without a traceback. Include complete synthetic tests in source builds.
 - Preserve original source refs and document each module's reviewed/tested limits.

@@ -53,6 +53,41 @@ def test_missing_dependency_is_a_concise_error(monkeypatch, capsys):
     assert "Traceback" not in captured.err
 
 
+@pytest.mark.parametrize("failure", ["write", "flush"])
+def test_failed_optional_log_does_not_abort_command(monkeypatch, capsys, failure):
+    class FullLog(io.StringIO):
+        def write(self, data):
+            if failure == "write":
+                raise OSError("synthetic disk full")
+            return super().write(data)
+
+        def flush(self):
+            if failure == "flush":
+                raise OSError("synthetic disk full")
+            return super().flush()
+
+    log = FullLog()
+    original_out, original_err = sys.stdout, sys.stderr
+
+    def init(_command):
+        sys.stdout = main._Tee(original_out, log, original_err)
+        sys.stderr = main._Tee(original_err, log, original_err)
+        return "synthetic.log"
+
+    def fake_monitor(_args):
+        print('{"ok":true}')
+        sys.stdout.flush()
+        return 0
+
+    monkeypatch.setattr(main, "_init_log", init)
+    monkeypatch.setattr(monitor, "cmd_monitor", fake_monitor)
+    assert main.main(["monitor", "--once", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == '{"ok":true}\n'
+    assert "diagnostic log disabled" in captured.err
+    assert log.closed
+
+
 def test_memory_workload_failure_is_a_concise_error(monkeypatch, capsys):
     monkeypatch.setattr(memtest, "get_gpu_memory_backend", lambda _gpu: None)
 
