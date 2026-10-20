@@ -37,7 +37,12 @@ left unreviewed; explicitly excluded paths/features follow the table.
 Other inspected build/entrypoint files: `pyproject.toml`, `MANIFEST.in`,
 `.github/workflows/python-tests.yml`, `.gitignore`, README, changelog and license.
 Build metadata now includes source-distribution tests and review documents.
-Existing CI covers offline tests on Linux Python 3.10/3.13 and Windows 3.13.
+Existing CI is configured for offline tests on Linux Python 3.10/3.13 and Windows
+3.13. Hosted jobs did not start because of an account billing lock. Local tested
+versions and exact checks are recorded in the external release receipt.
+The lint gate explicitly selects the historical core error rules E4/E7/E9/F;
+newer Ruff default style-rule expansion is outside this bounded gate. Both the
+original Ruff 0.12.4 and clean-install Ruff 0.17.1 pass this same explicit gate.
 
 ## Exclusions and remaining qualification
 
