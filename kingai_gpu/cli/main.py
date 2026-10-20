@@ -202,6 +202,14 @@ def main(argv: list[str] | None = None) -> int:
     Returns 0 on success, non-zero on error. Designed to be called
     from the console_scripts entry point defined in pyproject.toml.
     """
+    # Pipes may inherit a legacy Windows code page or an ASCII locale. CLI
+    # output is UTF-8 so Unicode paths/telemetry cannot abort diagnostics.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure") and not stream.isatty():
+            try:
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+            except (OSError, ValueError):
+                pass
     parser = build_parser()
     args = parser.parse_args(argv)
 

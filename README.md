@@ -64,6 +64,7 @@ message; diagnostics and log paths go to stderr. stdout telemetry and stderr
 diagnostics are mirrored character-for-character to per-user log files under
 `%LOCALAPPDATA%\KingAiGPU\logs` on Windows or the XDG state directory on Linux.
 Set `KINGAI_GPU_LOG_DIR` to choose another directory.
+Redirected CLI stdout/stderr use UTF-8, including on Windows with a legacy code page.
 
 ## Plan, execute, and inspect settings
 

@@ -8,6 +8,7 @@
 - Add installed module launching/version output, restore redirected streams and
   close each command's diagnostic log, tolerate failed optional log writes, and
   report missing dependencies cleanly.
+- Use UTF-8 for redirected CLI output so Unicode paths survive legacy code pages.
 - Reject non-finite monitoring intervals before NVML and contain memory-workload
   failures without a traceback. Include complete synthetic tests in source builds.
 - Preserve original source refs and document each module's reviewed/tested limits.
