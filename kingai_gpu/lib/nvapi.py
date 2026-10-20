@@ -7,7 +7,7 @@ Uses undocumented NvAPI functions via nvapi_QueryInterface for:
   - Thermal limit (ClientThermalPoliciesSetLimit)
   - Fan speed control (SetCoolerLevels / ClientFanCoolersSetControl)
 
-Struct sizes validated by binary probing on real hardware.
+These legacy struct layouts have not been physically qualified by this release.
 Reference: Demion/nvapioc (C++ OC tool), falahati/NvAPIWrapper (C# wrapper)
 """
 
@@ -475,7 +475,7 @@ def _get_gpu_name(gpu: int = 0) -> str:
 
 
 def _get_bus_id(gpu: int = 0) -> int:
-    """Get GPU PCI bus ID."""
+    """Get GPU PCI bus ID, or -1 when unavailable (bus zero is valid)."""
     h = _handle(gpu)
     bus_id = ctypes.c_uint(0)
     fn = _fn.get("GPU_GetBusId")
@@ -485,7 +485,7 @@ def _get_bus_id(gpu: int = 0) -> int:
             return bus_id.value
         except NvApiError:
             pass
-    return 0
+    return -1
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -841,6 +841,14 @@ def _set_cooler_auto(cooler_index: int = 0, gpu: int = 0):
     _check_set("GPU_SetCoolerLevels", fn, h, cooler_index, ctypes.cast(b, ctypes.c_void_p))
 
 
+def _fallback_fan_control(speed_pct: int, manual: bool, gpu: int):
+    """Preserve the requested mode when the newer fan API is unavailable."""
+    if manual:
+        _set_cooler_level(speed_pct, 0, gpu)
+    else:
+        _set_cooler_auto(0, gpu)
+
+
 def _set_fan_new_api(speed_pct: int, manual: bool = True, gpu: int = 0):
     """
     Set fan speed using new ClientFanCoolersSetControl API.
@@ -863,7 +871,7 @@ def _set_fan_new_api(speed_pct: int, manual: bool = True, gpu: int = 0):
 
     if fn_get is None or fn_set is None:
         # Fallback to old API
-        _set_cooler_level(speed_pct, 0, gpu)
+        _fallback_fan_control(speed_pct, manual, gpu)
         return
 
     # Get current control state
@@ -872,7 +880,7 @@ def _set_fan_new_api(speed_pct: int, manual: bool = True, gpu: int = 0):
         _check("GPU_ClientFanCoolersGetControl", fn_get(h, ctypes.cast(b, ctypes.c_void_p)))
     except NvApiError:
         # Fallback to old API
-        _set_cooler_level(speed_pct, 0, gpu)
+        _fallback_fan_control(speed_pct, manual, gpu)
         return
 
     # The fan count is usually at offset 8, but some driver versions put it
@@ -883,7 +891,7 @@ def _set_fan_new_api(speed_pct: int, manual: bool = True, gpu: int = 0):
 
     if count == 0 or count > 16:
         # Can't determine layout, use old API
-        _set_cooler_level(speed_pct, 0, gpu)
+        _fallback_fan_control(speed_pct, manual, gpu)
         return
 
     # Fan control entry layout (from FanCoolersGetControl V1):
@@ -898,13 +906,13 @@ def _set_fan_new_api(speed_pct: int, manual: bool = True, gpu: int = 0):
     # We compute entry size dynamically: (total_size - header) / count
     # If the math doesn't make sense, bail to old API.
     if count <= 0 or count > 32:
-        _set_cooler_level(speed_pct, 0, gpu)
+        _fallback_fan_control(speed_pct, manual, gpu)
         return
 
     entry_size = (_FAN_CONTROL_SIZE - 12) // count if count > 0 else 0
     if entry_size < 12 or entry_size > 256:
         # Can't determine layout, use old API
-        _set_cooler_level(speed_pct, 0, gpu)
+        _fallback_fan_control(speed_pct, manual, gpu)
         return
 
     mode_val = 1 if manual else 0

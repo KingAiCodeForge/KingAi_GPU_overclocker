@@ -516,7 +516,11 @@ def cmd_memtest(
     errors = 0
     iterations = 0
     while time.time() - started < args.duration:
-        tested = run_memtest(size_mb=args.size, gpu_index=gpu)
+        try:
+            tested = run_memtest(size_mb=args.size, gpu_index=gpu)
+        except Exception as exc:
+            print(f"Memory test failed: {exc}", file=sys.stderr)
+            return 1
         print(tested.summary())
         errors += tested.errors_detected
         iterations += 1

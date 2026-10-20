@@ -1,0 +1,2 @@
+include CHANGELOG.md PRESERVED_SOURCES.md RELEASE_REVIEW.md
+recursive-include tests *.py

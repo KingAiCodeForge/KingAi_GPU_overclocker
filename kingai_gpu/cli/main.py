@@ -34,21 +34,35 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from kingai_gpu import __version__
 
 # ── Logging tee ─────────────────────────────────────────────────────────────
 class _Tee:
     """Write to both a file and the original stream."""
-    def __init__(self, stream, log_file):
+    def __init__(self, stream, log_file, diagnostic_stream=None):
         self._stream = stream
         self._log = log_file
+        self._diagnostic_stream = diagnostic_stream
+        self._log_failed = False
+
+    def _mirror(self, operation, *args):
+        if self._log_failed:
+            return
+        try:
+            operation(*args)
+        except OSError as exc:
+            self._log_failed = True
+            if self._diagnostic_stream is not None:
+                self._diagnostic_stream.write(f"Warning: diagnostic log disabled: {exc}\n")
 
     def write(self, data):
-        self._stream.write(data)
-        self._log.write(data)
+        written = self._stream.write(data)
+        self._mirror(self._log.write, data)
+        return written
 
     def flush(self):
         self._stream.flush()
-        self._log.flush()
+        self._mirror(self._log.flush)
 
     def __getattr__(self, name):
         return getattr(self._stream, name)
@@ -75,8 +89,9 @@ def _init_log(command: str) -> str:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     log_path = logs_dir / f"{command}_{stamp}.log"
     log_file = open(log_path, "x", encoding="utf-8")
-    sys.stdout = _Tee(sys.__stdout__, log_file)
-    sys.stderr = _Tee(sys.__stderr__, log_file)
+    diagnostic_stream = sys.stderr
+    sys.stdout = _Tee(sys.stdout, log_file, diagnostic_stream)
+    sys.stderr = _Tee(sys.stderr, log_file, diagnostic_stream)
     return str(log_path)
 
 
@@ -90,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="kingai-gpu",
         description="KingAi GPU Overclocker — monitoring, OC control, and stability testing",
     )
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="command", help="Command to run")
 
     # ── monitor ── Real-time GPU monitoring dashboard
@@ -186,6 +202,14 @@ def main(argv: list[str] | None = None) -> int:
     Returns 0 on success, non-zero on error. Designed to be called
     from the console_scripts entry point defined in pyproject.toml.
     """
+    # Pipes may inherit a legacy Windows code page or an ASCII locale. CLI
+    # output is UTF-8 so Unicode paths/telemetry cannot abort diagnostics.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure") and not stream.isatty():
+            try:
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+            except (OSError, ValueError):
+                pass
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -194,7 +218,39 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    # Init logging tee — all subcommand output goes to logs/<command>_<ts>.log
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    try:
+        return _run_command(args, parser)
+    except ModuleNotFoundError as exc:
+        print(
+            f"Missing runtime dependency {exc.name!r}. "
+            "Install this package with its declared dependencies using pip.",
+            file=sys.stderr,
+        )
+        return 1
+    except OSError as exc:
+        print(f"Command failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        # main() is also a public Python entry point. Each invocation owns its
+        # log; restore callers' redirected streams even when dispatch fails.
+        logs = []
+        for stream, original in ((sys.stdout, original_stdout), (sys.stderr, original_stderr)):
+            if stream is not original and isinstance(stream, _Tee):
+                if stream._log not in logs:
+                    logs.append(stream._log)
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+        for log in logs:
+            try:
+                log.close()
+            except OSError:
+                pass
+
+
+def _run_command(args, parser) -> int:
+    """Dispatch one parsed command within its logging lifetime."""
+
+    # Per-user diagnostics are separate from machine-readable stdout.
     cmd_name = args.command if args.command not in ("mon", "m") else "monitor"
     cmd_name = cmd_name if cmd_name != "mem" else "memtest"
     try:
