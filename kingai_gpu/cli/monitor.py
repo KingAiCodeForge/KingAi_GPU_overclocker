@@ -22,6 +22,7 @@ import sys
 import time
 import csv
 import io
+import math
 from dataclasses import asdict
 from datetime import datetime
 
@@ -240,8 +241,8 @@ def cmd_monitor(args) -> int:
     In continuous mode, refreshes the screen at --interval rate until Ctrl+C.
     """
 
-    if args.interval <= 0:
-        print("Monitor interval must be greater than zero.", file=sys.stderr)
+    if not math.isfinite(args.interval) or args.interval <= 0:
+        print("Monitor interval must be finite and greater than zero.", file=sys.stderr)
         return 2
     if args.gpu < 0:
         print("GPU index must not be negative.", file=sys.stderr)

@@ -107,6 +107,52 @@ def test_low_level_writer_accepts_literal_execute_true(fake_nvapi_module, monkey
     set_clock.assert_called_once_with(domain_id=0, offset_khz=12500, gpu=3)
 
 
+@pytest.mark.parametrize("status", [None, -3])
+def test_unavailable_bus_id_does_not_impersonate_bus_zero(
+    fake_nvapi_module, monkeypatch, status,
+):
+    monkeypatch.setattr(fake_nvapi_module, "_handle", lambda _gpu: None)
+    get_bus = None if status is None else lambda *_args: status
+    monkeypatch.setitem(fake_nvapi_module._fn, "GPU_GetBusId", get_bus)
+    assert fake_nvapi_module._get_bus_id() == -1
+
+
+def test_real_bus_zero_remains_valid(fake_nvapi_module, monkeypatch):
+    monkeypatch.setattr(fake_nvapi_module, "_handle", lambda _gpu: None)
+    monkeypatch.setitem(fake_nvapi_module._fn, "GPU_GetBusId", lambda *_args: 0)
+    assert fake_nvapi_module._get_bus_id() == 0
+
+
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("reason", ["missing", "get-error", "count-zero", "entry-size"])
+def test_fan_fallback_preserves_requested_mode(
+    fake_nvapi_module, monkeypatch, manual, reason,
+):
+    module = fake_nvapi_module
+    monkeypatch.setattr(module, "_handle", lambda _gpu: None)
+
+    def fake_get(_handle, pointer):
+        if reason == "get-error":
+            return -3
+        if reason == "entry-size":
+            ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint32))[2] = 1
+        return 0
+
+    monkeypatch.setitem(module._fn, "GPU_ClientFanCoolersGetControl",
+                        None if reason == "missing" else fake_get)
+    monkeypatch.setitem(module._fn, "GPU_ClientFanCoolersSetControl", Mock())
+    level, auto = Mock(), Mock()
+    monkeypatch.setattr(module, "_set_cooler_level", level)
+    monkeypatch.setattr(module, "_set_cooler_auto", auto)
+    module._set_fan_new_api(0, manual=manual, gpu=3)
+    if manual:
+        level.assert_called_once_with(0, 0, 3)
+        auto.assert_not_called()
+    else:
+        auto.assert_called_once_with(0, 3)
+        level.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "invoke",
     [

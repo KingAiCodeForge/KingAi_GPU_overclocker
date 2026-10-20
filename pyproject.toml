@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kingai-gpu"
-version = "0.2.0"
+version = "0.2.1rc1"
 description = "Open-source GPU monitoring, overclocking, and stability testing for NVIDIA GPUs"
 readme = "README.md"
 license = "MIT"

@@ -39,7 +39,9 @@ rollback. Use the CLI or its validated orchestration for normal operation.
 ## Install
 
 ```bash
-python -m pip install -e .
+python -m pip install /path/to/kingai_gpu-0.2.1rc1-py3-none-any.whl
+kingai-gpu --version
+python -m kingai_gpu --help
 ```
 
 Monitoring requires `nvidia-ml-py`. Hardware control is Windows-only and uses
@@ -164,8 +166,11 @@ profile against the intended GPU and review the generated plan.
   binding, uninstall that standalone distribution and reinstall
   `nvidia-ml-py`; the import module remains named `pynvml`.
 
-See [CHANGELOG.md](CHANGELOG.md) for the defects corrected by the current
-unreleased batch.
+See [RELEASE_REVIEW.md](RELEASE_REVIEW.md) for the per-module review and explicit
+software/hardware qualification limits, and [PRESERVED_SOURCES.md](PRESERVED_SOURCES.md)
+for exact original source provenance. This prerelease fixes CLI/logging failures,
+unavailable bus identity handling and automatic-fan fallback behavior using
+offline regressions only. It does not establish physical hardware safety.
 
 ## Development
 
@@ -200,6 +205,6 @@ tests/
 
 ## Version and license
 
-Current package version: `0.2.0`.
+Current package version: `0.2.1rc1` (software qualification prerelease).
 
 MIT License; see `LICENSE`.
